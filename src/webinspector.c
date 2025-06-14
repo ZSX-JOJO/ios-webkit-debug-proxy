@@ -43,6 +43,7 @@
 #define MAX_BODY_LENGTH 1<<26
 
 struct wi_private {
+  bool is_sim;
   bool partials_supported;
   cb_t in;
   cb_t partial;
@@ -231,6 +232,31 @@ wi_status wi_on_debug(wi_t self, const char *message,
   return WI_SUCCESS;
 }
 
+wi_status wi_send(wi_t self, const char *data, size_t data_len) {
+  size_t length = data_len + 4;
+  char *out_head = (char*)malloc(length);
+  if (!out_head) {
+    return WI_ERROR;
+  }
+  char *out_tail = out_head;
+
+  // write big-endian int
+  *out_tail++ = ((data_len >> 24) & 0xFF);
+  *out_tail++ = ((data_len >> 16) & 0xFF);
+  *out_tail++ = ((data_len >> 8) & 0xFF);
+  *out_tail++ = (data_len & 0xFF);
+
+  if (data) {
+    memcpy(out_tail, data, data_len);
+  }
+
+  wi_on_debug(self, "wi.send_packet", out_head, length);
+  wi_status ret = self->send_packet(self, out_head, length);
+
+  free(out_head);
+  return ret;
+}
+
 /*
    WIRFinalMessageKey
    __selector
@@ -241,57 +267,37 @@ wi_status wi_send_plist(wi_t self, plist_t rpc_dict) {
   char *rpc_bin = NULL;
   uint32_t rpc_len = 0;
   plist_to_bin(rpc_dict, &rpc_bin, &rpc_len);
-  // if our message is <8k, we'll send a single final_msg,
-  // otherwise we'll send <8k partial_msg "chunks" then a final_msg "chunk"
+
   wi_status ret = WI_ERROR;
+  if (!my->partials_supported) {
+    ret = wi_send(self, rpc_bin, rpc_len);
+    free(rpc_bin);
+    if (!my->is_sim) {
+      // webinspectord may not ack the message with relatively big payloads
+      // sending an empty payload to prompt the processing of the last message
+      wi_send(self, NULL, 0);
+    }
+    return ret;
+  }
+
   uint32_t i;
   for (i = 0; ; i += MAX_RPC_LEN) {
-    bool is_partial = false;
+    bool is_partial = (rpc_len - i > MAX_RPC_LEN);
     char *data = NULL;
     uint32_t data_len = 0;
-    if (!my->partials_supported) {
-      data = rpc_bin;
-      data_len = rpc_len;
-      rpc_bin = NULL;
-    } else {
-      is_partial = (rpc_len - i > MAX_RPC_LEN);
-      plist_t wi_dict = plist_new_dict();
-      plist_t wi_rpc = plist_new_data(rpc_bin + i,
-          (is_partial ? MAX_RPC_LEN : rpc_len - i));
-      plist_dict_set_item(wi_dict,
-          (is_partial ? "WIRPartialMessageKey" : "WIRFinalMessageKey"), wi_rpc);
-      plist_to_bin(wi_dict, &data, &data_len);
-      plist_free(wi_dict);
-      wi_dict = NULL;
-      wi_rpc = NULL; // freed by wi_dict
-      if (!data) {
-        break;
-      }
-    }
-
-    size_t length = data_len + 4;
-    char *out_head = (char*)malloc(length * sizeof(char));
-    if (!out_head) {
-      if (my->partials_supported) {
-        free(data);
-      }
+    plist_t wi_dict = plist_new_dict();
+    plist_t wi_rpc = plist_new_data(rpc_bin + i,
+        (is_partial ? MAX_RPC_LEN : rpc_len - i));
+    plist_dict_set_item(wi_dict,
+        (is_partial ? "WIRPartialMessageKey" : "WIRFinalMessageKey"), wi_rpc);
+    plist_to_bin(wi_dict, &data, &data_len);
+    plist_free(wi_dict);
+    if (!data) {
       break;
     }
-    char *out_tail = out_head;
 
-    // write big-endian int
-    *out_tail++ = ((data_len >> 24) & 0xFF);
-    *out_tail++ = ((data_len >> 16) & 0xFF);
-    *out_tail++ = ((data_len >> 8) & 0xFF);
-    *out_tail++ = (data_len & 0xFF);
-
-    // write data
-    memcpy(out_tail, data, data_len);
+    wi_status not_sent = wi_send(self, data, data_len);
     free(data);
-
-    wi_on_debug(self, "wi.send_packet", out_head, length);
-    wi_status not_sent = self->send_packet(self, out_head, length);
-    free(out_head);
     if (not_sent) {
       break;
     }
@@ -509,7 +515,7 @@ void wi_free(wi_t self) {
     free(self);
   }
 }
-wi_t wi_new(bool partials_supported) {
+wi_t wi_new(bool is_sim, bool partials_supported) {
   wi_t self = (wi_t)malloc(sizeof(struct wi_struct));
   if (!self) {
     return NULL;
@@ -524,6 +530,7 @@ wi_t wi_new(bool partials_supported) {
     wi_free(self);
     return NULL;
   }
+  self->private_state->is_sim = is_sim;
   self->private_state->partials_supported = partials_supported;
   return self;
 }
